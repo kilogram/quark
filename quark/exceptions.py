@@ -55,3 +55,7 @@ class ProvidernetParamError(exceptions.QuantumException):
 
 class BadNVPState(exceptions.QuantumException):
     message = _("No networking information found for network %(net_id)s")
+
+
+class DriverLimitReached(exceptions.InvalidInput):
+    message = _("Driver has reached limit on resource '%(limit)s'")

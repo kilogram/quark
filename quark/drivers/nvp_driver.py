@@ -20,6 +20,7 @@ NVP client driver for Quark
 from oslo.config import cfg
 
 import aiclib
+import contextlib
 from quantum.extensions import securitygroup as sg_ext
 from quantum.openstack.common import log as logging
 
@@ -60,11 +61,27 @@ physical_net_type_map = {
 CONF.register_opts(nvp_opts, "NVP")
 
 
+def request_check(limits):
+    """Decorating function which requests a limit check in the plugin."""
+    def passthrough(func):
+        def with_request_check(self, *args, **kwargs):
+            unchecked_limits = [(limit if (self.limits.get(limit, True)
+                                is not False) else None) for limit in limits]
+            if any(unchecked_limits):
+                LOG.warning("Driver limit checks on %s expected but "
+                            "not performed in plugin." % unchecked_limits)
+            return func(self, *args, **kwargs)
+        return with_request_check
+    return passthrough
+
+
 class NVPDriver(base.BaseDriver):
     def __init__(self):
         self.nvp_connections = []
         self.conn_index = 0
-        self.max_ports_per_switch = 0
+        self.limits = {'max_ports_per_switch': 0,
+                       'max_rules_per_group': 0,
+                       'max_rules_per_port': 0}
 
     def load_config(self, path):
         #NOTE(mdietz): What does default_tz actually mean?
@@ -72,7 +89,10 @@ class NVPDriver(base.BaseDriver):
         default_tz = CONF.NVP.default_tz
         LOG.info("Loading NVP settings " + str(default_tz))
         connections = CONF.NVP.controller_connection
-        self.max_ports_per_switch = CONF.NVP.max_ports_per_switch
+        self.limits.update({
+            'max_ports_per_switch': CONF.NVP.max_ports_per_switch,
+            'max_rules_per_group': CONF.NVP.max_rules_per_group,
+            'max_rules_per_port': CONF.NVP.max_rules_per_port})
         LOG.info("Loading NVP settings " + str(connections))
         for conn in connections:
             (ip, port, user, pw, req_timeout,
@@ -99,6 +119,32 @@ class NVPDriver(base.BaseDriver):
                                                        username=user,
                                                        password=passwd)
         return conn["connection"]
+
+    @contextlib.contextmanager
+    def limits_checked(self, limits):
+        """Inform the driver of hard limit checks performed in plugin.
+
+        Ex.:
+        with net_driver.limits_checked(['example_limit']):
+            net_driver.example_call()
+
+        : param limits: the limits which the plugin is checking.
+        """
+        orig_limits = {}
+        for limit in limits:
+            orig_limits[limit], self.limits[limit] = (self.limits[limit],
+                                                      False)
+        yield orig_limits
+        self.limits.update(orig_limits)
+
+    def get_driver_limits(self, limits):
+        """Returns the driver limits requested.
+
+        : param limits: list with keys of requested limits
+        """
+        driver_limits = dict((k, v) for (k, v) in self.limits.items()
+                             if k in limits)
+        return driver_limits
 
     def create_network(self, context, network_name, tags=None,
                        network_id=None, **kwargs):
@@ -169,6 +215,7 @@ class NVPDriver(base.BaseDriver):
                         phys_type=phys_type, segment_id=segment_id)
         return {}
 
+    @request_check(['max_rules_per_group'])
     def create_security_group(self, context, group_name, **group):
         tenant_id = context.tenant_id
         connection = self.get_connection()
@@ -178,10 +225,12 @@ class NVPDriver(base.BaseDriver):
             profile.display_name(group_name)
         ingress_rules = group.get('port_ingress_rules', [])
         egress_rules = group.get('port_egress_rules', [])
-        if (len(ingress_rules) + len(egress_rules) >
-                CONF.NVP.max_rules_per_group):
-            raise sg_ext.qexception.InvalidInput(
-                error_message="Max rules for group %s" % group_id)
+
+        limit = self.limits['max_rules_per_group']
+        if (limit is not False and
+                len(ingress_rules) + len(egress_rules) > limit):
+            raise exceptions.DriverLimitReached(limit="rules per group")
+
         if egress_rules:
             profile.port_egress_rules(egress_rules)
         if ingress_rules:
@@ -198,6 +247,7 @@ class NVPDriver(base.BaseDriver):
         LOG.debug("Deleting security profile %s" % group_id)
         connection.securityprofile(guuid).delete()
 
+    @request_check(['max_rules_per_group'])
     def update_security_group(self, context, group_id, **group):
         query = self._get_security_group(context, group_id)
         connection = self.get_connection()
@@ -207,10 +257,11 @@ class NVPDriver(base.BaseDriver):
                                   query.get('logical_port_ingress_rules'))
         egress_rules = group.get('port_egress_rules',
                                  query.get('logical_port_egress_rules'))
-        if (len(ingress_rules) + len(egress_rules) >
-                CONF.NVP.max_rules_per_group):
-            raise sg_ext.qexception.InvalidInput(
-                error_message="Max rules for group %s" % group_id)
+
+        limit = self.limits['max_rules_per_group']
+        if (limit is not False and
+                len(ingress_rules) + len(egress_rules) > limit):
+            raise exceptions.DriverLimitReached(limit="rules per group")
 
         if group.get('name', None):
             profile.display_name(group['name'])
@@ -221,32 +272,42 @@ class NVPDriver(base.BaseDriver):
         return profile.update()
 
     def _update_security_group_rules(self, context, group_id, rule, operation,
-                                     check, raises):
+                                     checks):
         groupd = self._get_security_group(context, group_id)
         direction, secrule = self._get_security_group_rule_object(context,
                                                                   rule)
         rulelist = groupd['logical_port_%s_rules' % direction]
-        if not check(secrule, rulelist):
-            raise raises
-        else:
-            getattr(rulelist, operation)(secrule)
+        for check in checks:
+            if not check(secrule, rulelist):
+                raise checks[check]
+        getattr(rulelist, operation)(secrule)
 
         LOG.debug("%s rule on security group %s" % (operation, groupd['uuid']))
         group = {'port_%s_rules' % direction: rulelist}
         return self.update_security_group(context, group_id, **group)
 
+    @request_check(['max_rules_per_port'])
     def create_security_group_rule(self, context, group_id, rule):
+        def check_ports(*args):
+            limit = self.limits['max_rules_per_port']
+            if limit and self._check_rule_count_per_port(
+                    context, group_id) >= limit:
+                return False
+            return True
+
         return self._update_security_group_rules(
             context, group_id, rule, 'append',
-            lambda x, y: x not in y,
-            sg_ext.SecurityGroupRuleExists(id=group_id))
+            {(lambda x, y: x not in y):
+             sg_ext.SecurityGroupRuleExists(id=group_id),
+             check_ports:
+             exceptions.DriverLimitReached(limit="rules per port")})
 
     def delete_security_group_rule(self, context, group_id, rule):
         return self._update_security_group_rules(
             context, group_id, rule, 'remove',
-            lambda x, y: x in y,
-            sg_ext.SecurityGroupRuleNotFound(id="with group_id %s" %
-                                             group_id))
+            {(lambda x, y: x in y):
+             sg_ext.SecurityGroupRuleNotFound(id="with group_id %s" %
+                                              group_id)})
 
     def _create_or_choose_lswitch(self, context, network_id):
         switches = self._lswitch_status_query(context, network_id)
@@ -278,8 +339,8 @@ class NVPDriver(base.BaseDriver):
         if switches is not None:
             for res in switches["results"]:
                 count = res["_relations"]["LogicalSwitchStatus"]["lport_count"]
-                if self.max_ports_per_switch == 0 or \
-                        count < self.max_ports_per_switch:
+                if self.limits['max_ports_per_switch'] == 0 or \
+                        count < self.limits['max_ports_per_switch']:
                     return res["uuid"]
         return None
 
@@ -405,14 +466,31 @@ class NVPDriver(base.BaseDriver):
                 "Direction not specified as 'ingress' or 'egress'.")
         return (direction, secrule)
 
+    def _check_rule_count_per_port(self, context, group_id):
+        connection = self.get_connection()
+        ports = connection.lswitch_port("*").query().security_profile_uuid(
+            self._get_security_group_id(
+                context, group_id)).results().get('results', [])
+        groups = set(group for port in ports for
+                     group in port.get('security_profiles', []))
+        return self._check_rule_count_for_groups(
+            context,
+            (connection.securityprofile(group).read() for group in groups))
+
+    def _check_rule_count_for_groups(self, context, groups):
+        return sum(len(group['logical_port_ingress_rules']) +
+                   len(group['logical_port_egress_rules'])
+                   for group in groups)
+
+    @request_check(['max_rules_per_port'])
     def _get_security_groups_for_port(self, context, groups):
-        rulecount = 0
-        nvp_group_ids = []
-        for group in groups:
-            nvp_group = self._get_security_group(context, group)
-            rulecount += (len(nvp_group['logical_port_ingress_rules']) +
-                          len(nvp_group['logical_port_egress_rules']))
-            nvp_group_ids.append(nvp_group['uuid'])
-        if rulecount > CONF.NVP.max_rules_per_port:
-            raise sg_ext.qexception.OverQuota(overs='security rules per port')
-        return nvp_group_ids
+        limit = self.limits['max_rules_per_port']
+        if (limit is not False and
+            self._check_rule_count_for_groups(
+                context,
+                (self._get_security_group(context, g) for g in groups))
+                > limit):
+            raise exceptions.DriverLimitReached(limit="rules per port")
+
+        return [self._get_security_group(context, group)['uuid']
+                for group in groups]
