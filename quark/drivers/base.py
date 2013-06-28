@@ -13,6 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #
 
+import contextlib
 from quantum.openstack.common import log as logging
 
 LOG = logging.getLogger("quantum.quark.base")
@@ -28,6 +29,15 @@ class BaseDriver(object):
 
     def get_connection(self):
         LOG.info("get_connection")
+
+    @contextlib.contextmanager
+    def limits_checked(self, limits):
+        LOG.debug("plugin is checking %s" % limits)
+        yield
+
+    def get_driver_limits(self, limits):
+        LOG.info("get_driver_limits")
+        return dict((limit, None) for limit in limits.keys())
 
     def create_network(self, tenant_id, network_name, tags=None,
                        network_id=None, **kwargs):
