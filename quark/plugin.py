@@ -35,6 +35,7 @@ from quantum.openstack.common.db.sqlalchemy import session as quantum_session
 from quantum.openstack.common import importutils
 from quantum.openstack.common import log as logging
 from quantum.openstack.common import uuidutils
+from quantum import quota
 
 from quantum import quantum_plugin_base_v2
 
@@ -66,8 +67,18 @@ quark_opts = [
                help=_("Path to the config for the net driver"))
 ]
 
+quark_quota_opts = [
+    cfg.IntOpt('quota_ports_per_network',
+               default=64,
+               help=_('Maximum ports per network per tenant')),
+    cfg.IntOpt('quota_security_rules_per_group',
+               default=20,
+               help=_('Maximum security group rules in a group')),
+]
+
 STRATEGY = network_strategy.STRATEGY
 CONF.register_opts(quark_opts, "QUARK")
+CONF.register_opts(quark_quota_opts, "QUOTAS")
 
 
 def _pop_param(attrs, param, default=None):
@@ -92,7 +103,7 @@ class Plugin(quantum_plugin_base_v2.QuantumPluginBaseV2,
              sg_ext.SecurityGroupPluginBase):
     supported_extension_aliases = ["mac_address_ranges", "routes",
                                    "ip_addresses", "ports_quark",
-                                   "security-group",
+                                   "security-group", "quotas",
                                    "subnets_quark", "provider"]
 
     def _initDBMaker(self):
@@ -124,6 +135,14 @@ class Plugin(quantum_plugin_base_v2.QuantumPluginBaseV2,
         self.ipam_driver = (importutils.import_class(CONF.QUARK.ipam_driver))()
         self.ipam_reuse_after = CONF.QUARK.ipam_reuse_after
         quantum_db_api.register_models(base=models.BASEV2)
+
+        quark_resources = [
+            quota.BaseResource('ports_per_network',
+                               'quota_ports_per_network'),
+            quota.BaseResource('security_rules_per_group',
+                               'quota_security_rules_per_group'),
+        ]
+        quota.QUOTAS.register_resources(quark_resources)
 
     def _make_security_group_list(self, context, group_ids):
         if not group_ids or group_ids is attributes.ATTR_NOT_SPECIFIED:
@@ -589,6 +608,10 @@ class Plugin(quantum_plugin_base_v2.QuantumPluginBaseV2,
             net = db_api.network_find(context, id=net_id, scope=db_api.ONE)
             if not net:
                 raise exceptions.NetworkNotFound(net_id=net_id)
+
+        quota.QUOTAS.limit_check(
+            context, context.tenant_id,
+            ports_per_network=len(net.get('ports', []))+1)
 
         if fixed_ips:
             for fixed_ip in fixed_ips:
@@ -1080,9 +1103,6 @@ class Plugin(quantum_plugin_base_v2.QuantumPluginBaseV2,
     def create_security_group(self, context, security_group):
         LOG.info("create_security_group for tenant %s" %
                 (context.tenant_id))
-        if (db_api.security_group_find(context).count() >=
-                CONF.QUOTAS.quota_security_group):
-            raise exceptions.OverQuota(overs="security groups")
         group = security_group["security_group"]
         group_name = group.get('name', '')
         if group_name == "default":
@@ -1107,14 +1127,13 @@ class Plugin(quantum_plugin_base_v2.QuantumPluginBaseV2,
             'group_id': '00000000-0000-0000-0000-000000000000',
             'port_egress_rules': [],
             'port_ingress_rules': [
-                {'ethertype': 'IPv4', 'protocol': 6,
-                    'port_range_min': 0, 'port_range_max': 65535},
-                {'ethertype': 'IPv4', 'protocol': 17,
-                    'port_range_min': 0, 'port_range_max': 65535},
-                {'ethertype': 'IPv6', 'protocol': 6,
-                    'port_range_min': 0, 'port_range_max': 65535},
-                {'ethertype': 'IPv6', 'protocol': 17,
-                    'port_range_min': 0, 'port_range_max': 65535}]}
+                {'ethertype': 'IPv4', 'protocol': 1},
+                {'ethertype': 'IPv4', 'protocol': 6},
+                {'ethertype': 'IPv4', 'protocol': 17},
+                {'ethertype': 'IPv6', 'protocol': 1},
+                {'ethertype': 'IPv6', 'protocol': 6},
+                {'ethertype': 'IPv6', 'protocol': 17},
+            ]}
 
         self.net_driver.create_security_group(
             context,
@@ -1134,9 +1153,6 @@ class Plugin(quantum_plugin_base_v2.QuantumPluginBaseV2,
     def create_security_group_rule(self, context, security_group_rule):
         LOG.info("create_security_group for tenant %s" %
                 (context.tenant_id))
-        if (db_api.security_group_rule_find(context).count() >=
-                CONF.QUOTAS.quota_security_group_rule):
-            raise exceptions.OverQuota(overs="security group rules")
         rule = self._validate_security_group_rule(
             context, security_group_rule["security_group_rule"])
         rule['id'] = uuidutils.generate_uuid()
@@ -1146,6 +1162,10 @@ class Plugin(quantum_plugin_base_v2.QuantumPluginBaseV2,
                                            scope=db_api.ONE)
         if not group:
             raise sg_ext.SecurityGroupNotFound(group_id=group_id)
+
+        quota.QUOTAS.limit_check(
+            context, context.tenant_id,
+            security_rules_per_group=len(group.get('rules', []))+1)
 
         self.net_driver.create_security_group_rule(
             context,
