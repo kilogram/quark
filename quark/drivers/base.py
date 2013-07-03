@@ -19,11 +19,28 @@ from quantum.openstack.common import log as logging
 LOG = logging.getLogger("quantum.quark.base")
 
 
+def request_check(limits):
+    """Decorating function which requests a limit check in the plugin."""
+    def passthrough(func):
+        def with_request_check(self, *args, **kwargs):
+            unchecked_limits = [l for l in limits if
+                                self.limits.get(l, True) is not False]
+            if unchecked_limits:
+                LOG.warning("Driver limit checks on %s expected but "
+                            "not performed in plugin." % unchecked_limits)
+            return func(self, *args, **kwargs)
+        return with_request_check
+    return passthrough
+
+
 class BaseDriver(object):
     """Base interface for all Quark drivers.
 
     Usable as a replacement for the sample plugin.
     """
+    def __init__(self):
+        self.limits = {}
+
     def load_config(self, path):
         LOG.info("load_config %s" % path)
 
@@ -32,12 +49,14 @@ class BaseDriver(object):
 
     @contextlib.contextmanager
     def limits_checked(self, limits):
-        LOG.debug("plugin is checking %s" % limits)
-        yield
+        orig_limits = {}
+        for l in limits:
+            self.limits[l], orig_limits[l] = False, self.limits.get(l, False)
+        yield orig_limits
+        self.limits.update(orig_limits)
 
     def get_driver_limits(self, limits):
-        LOG.info("get_driver_limits")
-        return dict((limit, None) for limit in limits.keys())
+        return dict(self.limits.get(l, None) for l in limits)
 
     def create_network(self, tenant_id, network_name, tags=None,
                        network_id=None, **kwargs):

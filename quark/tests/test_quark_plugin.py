@@ -1923,7 +1923,6 @@ class TestQuarkCreateSecurityGroupRule(TestQuarkPlugin):
         dbrule.group_id = rule['security_group_id']
         dbgroup = None
         if group:
-            print group
             dbgroup = models.SecurityGroup()
             dbgroup.update(group)
 

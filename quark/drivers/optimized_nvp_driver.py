@@ -96,7 +96,6 @@ class OptimizedNVPDriver(NVPDriver):
             first()
         return port
 
-        #self.net_driver.get_driver_limits({'max_rules_per_group', True})
     def _lswitch_delete(self, context, lswitch_uuid):
         switch = self._lswitch_select_by_nvp_id(context, lswitch_uuid)
         super(OptimizedNVPDriver, self).\

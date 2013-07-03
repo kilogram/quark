@@ -20,7 +20,6 @@ NVP client driver for Quark
 from oslo.config import cfg
 
 import aiclib
-import contextlib
 from quantum.extensions import securitygroup as sg_ext
 from quantum.openstack.common import log as logging
 
@@ -59,20 +58,6 @@ physical_net_type_map = {
 }
 
 CONF.register_opts(nvp_opts, "NVP")
-
-
-def request_check(limits):
-    """Decorating function which requests a limit check in the plugin."""
-    def passthrough(func):
-        def with_request_check(self, *args, **kwargs):
-            unchecked_limits = [(limit if (self.limits.get(limit, True)
-                                is not False) else None) for limit in limits]
-            if any(unchecked_limits):
-                LOG.warning("Driver limit checks on %s expected but "
-                            "not performed in plugin." % unchecked_limits)
-            return func(self, *args, **kwargs)
-        return with_request_check
-    return passthrough
 
 
 class NVPDriver(base.BaseDriver):
@@ -119,32 +104,6 @@ class NVPDriver(base.BaseDriver):
                                                        username=user,
                                                        password=passwd)
         return conn["connection"]
-
-    @contextlib.contextmanager
-    def limits_checked(self, limits):
-        """Inform the driver of hard limit checks performed in plugin.
-
-        Ex.:
-        with net_driver.limits_checked(['example_limit']):
-            net_driver.example_call()
-
-        : param limits: the limits which the plugin is checking.
-        """
-        orig_limits = {}
-        for limit in limits:
-            orig_limits[limit], self.limits[limit] = (self.limits[limit],
-                                                      False)
-        yield orig_limits
-        self.limits.update(orig_limits)
-
-    def get_driver_limits(self, limits):
-        """Returns the driver limits requested.
-
-        : param limits: list with keys of requested limits
-        """
-        driver_limits = dict((k, v) for (k, v) in self.limits.items()
-                             if k in limits)
-        return driver_limits
 
     def create_network(self, context, network_name, tags=None,
                        network_id=None, **kwargs):
@@ -215,7 +174,7 @@ class NVPDriver(base.BaseDriver):
                         phys_type=phys_type, segment_id=segment_id)
         return {}
 
-    @request_check(['max_rules_per_group'])
+    @base.request_check(['max_rules_per_group'])
     def create_security_group(self, context, group_name, **group):
         tenant_id = context.tenant_id
         connection = self.get_connection()
@@ -227,8 +186,7 @@ class NVPDriver(base.BaseDriver):
         egress_rules = group.get('port_egress_rules', [])
 
         limit = self.limits['max_rules_per_group']
-        if (limit is not False and
-                len(ingress_rules) + len(egress_rules) > limit):
+        if limit and len(ingress_rules) + len(egress_rules) > limit:
             raise exceptions.DriverLimitReached(limit="rules per group")
 
         if egress_rules:
@@ -247,7 +205,7 @@ class NVPDriver(base.BaseDriver):
         LOG.debug("Deleting security profile %s" % group_id)
         connection.securityprofile(guuid).delete()
 
-    @request_check(['max_rules_per_group'])
+    @base.request_check(['max_rules_per_group'])
     def update_security_group(self, context, group_id, **group):
         query = self._get_security_group(context, group_id)
         connection = self.get_connection()
@@ -259,8 +217,7 @@ class NVPDriver(base.BaseDriver):
                                  query.get('logical_port_egress_rules'))
 
         limit = self.limits['max_rules_per_group']
-        if (limit is not False and
-                len(ingress_rules) + len(egress_rules) > limit):
+        if limit and len(ingress_rules) + len(egress_rules) > limit:
             raise exceptions.DriverLimitReached(limit="rules per group")
 
         if group.get('name', None):
@@ -286,7 +243,7 @@ class NVPDriver(base.BaseDriver):
         group = {'port_%s_rules' % direction: rulelist}
         return self.update_security_group(context, group_id, **group)
 
-    @request_check(['max_rules_per_port'])
+    @base.request_check(['max_rules_per_port'])
     def create_security_group_rule(self, context, group_id, rule):
         def check_ports(*args):
             limit = self.limits['max_rules_per_port']
@@ -482,11 +439,10 @@ class NVPDriver(base.BaseDriver):
                    len(group['logical_port_egress_rules'])
                    for group in groups)
 
-    @request_check(['max_rules_per_port'])
+    @base.request_check(['max_rules_per_port'])
     def _get_security_groups_for_port(self, context, groups):
         limit = self.limits['max_rules_per_port']
-        if (limit is not False and
-            self._check_rule_count_for_groups(
+        if (limit and self._check_rule_count_for_groups(
                 context,
                 (self._get_security_group(context, g) for g in groups))
                 > limit):
