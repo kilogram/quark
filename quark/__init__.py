@@ -54,5 +54,7 @@ quark_resources = [
 
 CONF.register_opts(quark_opts, "QUARK")
 CONF.register_opts(quark_quota_opts, "QUOTAS")
+CONF.set_override("quota_driver", "quark.quota_driver.QuarkQuotaDriver",
+                  "QUOTAS")
 
 quota.QUOTAS.register_resources(quark_resources)
